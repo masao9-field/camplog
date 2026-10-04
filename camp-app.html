@@ -157,6 +157,16 @@ details.panel[open] summary::after{content:'閉じる'}
 .bottomsheet .handle{width:36px;height:4px;border-radius:2px;background:var(--rule);margin:0 auto 12px}
 
 /* ===== 支出・記録タブ（枠） ===== */
+/* ===== アカウント・同期 ===== */
+.acct-bar{margin:0 12px 12px;padding:9px 12px;border:1px solid var(--rule);border-radius:3px;
+  display:flex;align-items:center;gap:10px;font-size:12.5px;color:var(--muted);background:rgba(228,226,214,.03)}
+.acct-bar .acct-text{flex:1;min-width:0;line-height:1.45}
+.acct-bar .acct-text b{color:var(--line);font-weight:600;display:block;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.acct-bar button{min-height:32px;padding:5px 11px;font-size:12.5px;flex-shrink:0}
+.sync-dot{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:5px;
+  background:var(--muted);vertical-align:middle}
+.sync-dot.ok{background:#7FC08A}.sync-dot.wait{background:var(--sun)}.sync-dot.err{background:#D9705F}
 .coming-soon{padding:48px 24px;text-align:center;color:var(--muted);font-size:14px}
 .coming-soon .emoji{font-size:36px;display:block;margin-bottom:10px}
 footer{margin-top:22px;padding:12px 0 4px;border-top:1px solid var(--rule);font-size:12px;color:var(--muted)}
@@ -178,6 +188,10 @@ footer{margin-top:22px;padding:12px 0 4px;border-top:1px solid var(--rule);font-
   <div class="top-header">
     <h1>キャンプ記録帳</h1>
     <div class="sub" id="topSaveNote"></div>
+  </div>
+  <div class="acct-bar" id="acctBar">
+    <div class="acct-text" id="acctText">同期の準備中…</div>
+    <button class="solid" id="acctBtn" style="display:none"></button>
   </div>
   <div class="trip-list" id="tripList"></div>
   <button class="fab" id="fabNew" aria-label="新しい旅を作る">＋</button>
@@ -242,7 +256,7 @@ footer{margin-top:22px;padding:12px 0 4px;border-top:1px solid var(--rule);font-
         <p class="note">旅の予定表を印刷用画面で開きます。ブラウザの「印刷 → PDFに保存」で保存・共有できます。</p>
         <div class="chips"><button id="printItinerary" style="background:rgba(232,163,61,.14);border-color:rgba(232,163,61,.5);color:#F2D9A8">🗒 しおりを印刷</button></div>
       </section>
-      <footer>データはこの端末に保存されます。</footer>
+      <footer>この端末に保存され、Googleログイン中はクラウドにも同期されます。</footer>
     </div>
   </div>
 
@@ -304,7 +318,7 @@ footer{margin-top:22px;padding:12px 0 4px;border-top:1px solid var(--rule);font-
       <div class="chips" style="margin-top:16px">
         <button id="addExpense" style="background:rgba(232,163,61,.14);border-color:rgba(232,163,61,.5);color:#F2D9A8">＋ 支出を追加</button>
       </div>
-      <footer>支出はこの端末に保存されます。</footer>
+      <footer>この端末に保存され、Googleログイン中はクラウドにも同期されます。</footer>
     </div>
   </div>
 
@@ -326,7 +340,7 @@ footer{margin-top:22px;padding:12px 0 4px;border-top:1px solid var(--rule);font-
           <button id="addWish" style="flex-shrink:0">追加</button>
         </div>
       </section>
-      <footer>記録はこの端末に保存されます。</footer>
+      <footer>この端末に保存され、Googleログイン中はクラウドにも同期されます。</footer>
     </div>
   </div>
 </div>
@@ -373,18 +387,90 @@ let tripUid = 1, legUid = 1, memberUid = 1, layoutUid = 1;
 function nextId(){ return Date.now().toString(36) + Math.random().toString(36).slice(2,5); }
 
 /* ===== 保存 ===== */
+/*  端末（localStorage）に保存しつつ、ログイン中は Firestore にも同期する。
+    各旅に _updatedAt（最終更新時刻）を持たせ、端末間で食い違ったら新しい方を採用。 */
 let saveTimer = null;
+const editSig = {};               /* 旅ごとの「前回保存時の中身」 */
+function sigOf(trip){ const {_updatedAt, ...rest} = trip; return JSON.stringify(rest); }
+function stampChanges(){          /* 中身が変わった旅だけ更新時刻を進める */
+  const now = Date.now();
+  DB.trips.forEach(t=>{
+    const sg = sigOf(t);
+    if(editSig[t.id] !== sg){ t._updatedAt = now; editSig[t.id] = sg; }
+  });
+}
+function persistLocal(){
+  try{ localStorage.setItem(CACHE_KEY, JSON.stringify(DB)); } catch(e){}
+}
 function save(){
   clearTimeout(saveTimer);
   saveTimer = setTimeout(()=>{
-    try{ localStorage.setItem(CACHE_KEY, JSON.stringify(DB)); } catch(e){}
+    stampChanges();
+    persistLocal();
     updateSaveNote();
+    if(window.CloudSync) window.CloudSync.push();
   }, 400);
 }
 function load(){
-  try{ const r=localStorage.getItem(CACHE_KEY); if(r){ DB=JSON.parse(r); return true; } }catch(e){}
+  try{
+    const r=localStorage.getItem(CACHE_KEY);
+    if(r){ DB=JSON.parse(r); DB.trips.forEach(t=>{ editSig[t.id]=sigOf(t); }); return true; }
+  }catch(e){}
   return false;
 }
+
+/* ===== クラウド同期から呼ばれる窓口 ===== */
+window.App = {
+  getTrips: ()=>DB.trips,
+  /* 他の端末から届いた旅を反映（同じオブジェクトを書き換えて参照切れを防ぐ） */
+  applyRemote(remote){
+    const t = DB.trips.find(x=>x.id===remote.id);
+    if(t){ Object.keys(t).forEach(k=>delete t[k]); Object.assign(t, remote); }
+    else DB.trips.push(remote);
+    editSig[remote.id] = sigOf(remote);
+  },
+  removeTrip(id){
+    const i = DB.trips.findIndex(x=>x.id===id);
+    if(i>=0) DB.trips.splice(i,1);
+    delete editSig[id];
+  },
+  clearAll(){ DB = { trips:[] }; Object.keys(editSig).forEach(k=>delete editSig[k]); persistLocal(); refreshAfterSync([]); },
+  persistLocal,
+  refresh: (ids)=>refreshAfterSync(ids)
+};
+
+/* 同期で中身が変わったら画面を描き直す（入力中なら入力が終わってから） */
+let pendingDetailRefresh = false;
+function refreshAfterSync(changedIds){
+  renderTripList();
+  const detailOpen = document.getElementById('scDetail').classList.contains('active');
+  if(!detailOpen || !currentTripId) return;
+  if(!currentTrip()){ showScreen('scTop'); return; }
+  if(changedIds && !changedIds.includes(currentTripId)) return;
+  const ae = document.activeElement;
+  if(ae && /INPUT|TEXTAREA|SELECT/.test(ae.tagName) && document.getElementById('scDetail').contains(ae)){
+    pendingDetailRefresh = true; return;
+  }
+  redrawDetail();
+}
+function redrawDetail(){
+  pendingDetailRefresh = false;
+  const trip = currentTrip(); if(!trip) return;
+  document.getElementById('detailTitleBar').textContent = trip.title||'無題の旅';
+  document.getElementById('detailStatusBar').textContent = STATUS_LABEL[trip.status||'plan'];
+  document.getElementById('detailStatusBar').className = 'detail-status status-'+(trip.status||'plan');
+  const active = document.querySelector('.tabpanel.active');
+  const name = active ? active.id.replace('tab-','') : 'itinerary';
+  if(name==='itinerary') renderItinerary();
+  else if(name==='expense') renderExpenses();
+  else if(name==='log') renderLog();
+}
+document.addEventListener('focusout', ()=>{
+  if(pendingDetailRefresh) setTimeout(()=>{
+    const ae=document.activeElement;
+    if(!(ae && /INPUT|TEXTAREA|SELECT/.test(ae.tagName))) redrawDetail();
+  }, 300);
+});
 function updateSaveNote(){
   const el = document.getElementById('topSaveNote');
   if(el) el.textContent = '保存済み '+ new Date().getHours().toString().padStart(2,'0')+':'+new Date().getMinutes().toString().padStart(2,'0');
@@ -1133,6 +1219,156 @@ document.getElementById('printItinerary').addEventListener('click', ()=>{
 (function init(){
   load();
   renderTripList();
+  /* 同期機能（Firebase）を読み込めなかった場合の表示 */
+  setTimeout(()=>{
+    if(!window.CloudSync){
+      const el=document.getElementById('acctText');
+      if(el) el.innerHTML='同期機能を読み込めませんでした<br><span style="font-size:11.5px">この端末には保存されます。電波のある場所で開き直すと同期します</span>';
+    }
+  }, 10000);
 })();
 
+</script>
+
+<!-- ===========================
+     クラウド同期（Firebase：Googleログイン + Firestore）
+     =========================== -->
+<script type="module">
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
+import { getAuth, GoogleAuthProvider, onAuthStateChanged, signInWithPopup, signInWithRedirect, signOut }
+  from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
+import { initializeFirestore, persistentLocalCache, persistentMultipleTabManager,
+  collection, doc, setDoc, deleteDoc, onSnapshot, serverTimestamp }
+  from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+
+const firebaseConfig = {
+  apiKey: "AIzaSyCcI8kTaNVIfnNa8OX6sgNLaU9D7lelG2A",
+  authDomain: "camplog-908b3.firebaseapp.com",
+  projectId: "camplog-908b3",
+  storageBucket: "camplog-908b3.firebasestorage.app",
+  messagingSenderId: "898476320468",
+  appId: "1:898476320468:web:875b268c99b1f4a56d3d41"
+};
+
+const app  = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+/* オフラインでも読み書きでき、電波が戻ったら自動で送信される設定 */
+const db = initializeFirestore(app, {
+  localCache: persistentLocalCache({ tabManager: persistentMultipleTabManager() })
+});
+
+const $text = document.getElementById('acctText');
+const $btn  = document.getElementById('acctBtn');
+
+let user = null;
+let unsub = null;
+let ready = false;            /* クラウドの初回読み込みが終わったか */
+let cloudJson = {};           /* 旅ID → クラウドにある最新の中身 */
+let lastState = 'wait';
+
+function setStatus(state, msg){
+  lastState = state;
+  if(!user){
+    $text.innerHTML = 'この端末だけに保存中<br><span style="font-size:11.5px">ログインするとPC・スマホで同期できます</span>';
+    $btn.textContent = 'Googleでログイン'; $btn.className='solid'; $btn.style.display='';
+    return;
+  }
+  const name = user.displayName || user.email || 'ログイン中';
+  $text.innerHTML = `<b>${escapeHtml(name)}</b><span class="sync-dot ${state}"></span>${msg}`;
+  $btn.textContent = 'ログアウト'; $btn.className='ghost'; $btn.style.display='';
+}
+function escapeHtml(s){ const d=document.createElement('div'); d.textContent=s; return d.innerHTML; }
+
+/* ===== ログイン / ログアウト ===== */
+$btn.addEventListener('click', async ()=>{
+  if(!user){
+    const provider = new GoogleAuthProvider();
+    provider.setCustomParameters({ prompt:'select_account' });
+    try{
+      await signInWithPopup(auth, provider);
+    }catch(e){
+      if(e.code==='auth/popup-blocked' || e.code==='auth/operation-not-supported-in-this-environment'){
+        await signInWithRedirect(auth, provider);
+      }else if(e.code!=='auth/popup-closed-by-user' && e.code!=='auth/cancelled-popup-request'){
+        alert('ログインできませんでした：' + (e.code||e.message));
+      }
+    }
+  }else{
+    if(lastState!=='ok' || !ready){
+      alert('まだクラウドに送れていない変更があるかもしれません。\n電波のある場所で「同期済み」になってからログアウトしてください。');
+      return;
+    }
+    if(!confirm('ログアウトします。\nこの端末のデータは消去されます（クラウドには残っているので、再ログインすれば戻ります）。\nよろしいですか？')) return;
+    await signOut(auth);
+    window.App.clearAll();
+  }
+});
+
+/* ===== ログイン状態の変化 ===== */
+onAuthStateChanged(auth, u=>{
+  if(unsub){ unsub(); unsub=null; }
+  user = u; ready = false; cloudJson = {};
+  if(!u){ setStatus('wait'); return; }
+  setStatus('wait', '読み込み中…');
+
+  const col = collection(db, 'users', u.uid, 'trips');
+  unsub = onSnapshot(col, { includeMetadataChanges:true }, snap=>{
+    const changed = [];
+    snap.docChanges().forEach(ch=>{
+      const id = ch.doc.id;
+      if(ch.type==='removed'){
+        if(!ch.doc.metadata.hasPendingWrites){
+          window.App.removeTrip(id); delete cloudJson[id]; changed.push(id);
+        }
+        return;
+      }
+      const d = ch.doc.data();
+      let remote; try{ remote = JSON.parse(d.json); }catch(e){ return; }
+      cloudJson[id] = d.json;
+      const local = window.App.getTrips().find(t=>t.id===id);
+      /* 手元に無い、またはクラウドの方が新しければ取り込む */
+      if(!local || (remote._updatedAt||0) > (local._updatedAt||0)){
+        window.App.applyRemote(remote); changed.push(id);
+      }
+    });
+    if(changed.length){ window.App.persistLocal(); window.App.refresh(changed); }
+
+    /* サーバーから最新を受け取ってから初めてアップロードする
+       （古い手元データでクラウドの新しいデータを上書きしないため） */
+    if(!ready && !snap.metadata.fromCache){ ready = true; push(); }
+
+    if(snap.metadata.hasPendingWrites)      setStatus('wait', navigator.onLine ? '同期中…' : 'オフライン（電波が戻ったら同期）');
+    else if(snap.metadata.fromCache)        setStatus('wait', 'オフライン（電波が戻ったら同期）');
+    else                                    setStatus('ok', '同期済み');
+  }, err=>{
+    console.error(err);
+    setStatus('err', err.code==='permission-denied' ? '同期エラー（権限がありません）' : '同期エラー');
+  });
+});
+
+/* ===== 手元の変更をクラウドへ ===== */
+function push(){
+  if(!user || !ready) return;
+  const trips = window.App.getTrips();
+  const ids = new Set();
+  trips.forEach(t=>{
+    ids.add(t.id);
+    const json = JSON.stringify(t);
+    if(cloudJson[t.id] === json) return;
+    cloudJson[t.id] = json;
+    setDoc(doc(db, 'users', user.uid, 'trips', t.id), {
+      json, updatedAt: t._updatedAt || 0, savedAt: serverTimestamp()
+    }).catch(e=>{ console.error(e); setStatus('err','同期エラー'); });
+  });
+  /* 手元で消えた旅はクラウドからも消す */
+  Object.keys(cloudJson).forEach(id=>{
+    if(ids.has(id)) return;
+    delete cloudJson[id];
+    deleteDoc(doc(db, 'users', user.uid, 'trips', id)).catch(e=>console.error(e));
+  });
+}
+
+window.CloudSync = { push };
+window.addEventListener('online',  ()=>{ if(user && lastState!=='ok') setStatus('wait','同期中…'); });
+window.addEventListener('offline', ()=>{ if(user) setStatus('wait','オフライン（電波が戻ったら同期）'); });
 </script>
